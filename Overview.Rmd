@@ -1,0 +1,605 @@
+---
+output:
+  html_document: default
+  author: "Raphael Hoogvliets"
+  pdf_document: default
+---
+### Kickoff
+```{r}
+load("D:/football/models.RData")
+```
+
+
+
+# Football Analytics
+
+![](./images/header.jpg) 
+
+##### Disclaimer: the developer of this notebook is not a Real Madrid fan.
+
+
+# Load libraries
+
+```{r message = FALSE}
+library(RSQLite)
+library(tidyverse)
+library(purrr)
+library(skimr)
+library(scales)
+library(data.table)
+library(caret)
+library(caretEnsemble)
+```
+
+# Load data
+
+```{r}
+# connect to sqlite database
+con <- dbConnect(drv=RSQLite::SQLite(), dbname="./data/database.sqlite")
+
+# list tables
+tables <- dbListTables(con)
+
+# select appropriate tables
+tables <- tables[tables != "sqlite_sequence"]
+
+# create empty list with lenght of table amount
+data_all <- vector("list", length=length(tables))
+
+# load tables into list as dataframes
+for (i in seq(along=tables)) {
+  data_all[[i]] <- dbGetQuery(conn=con, statement=paste("SELECT * FROM '", tables[[i]], "'", sep=""))
+}
+
+rm(i, con, tables)
+```
+
+# Exploring, organising and cleaning data
+
+```{r}
+# first peek at dataframes
+map(data_all, tail)
+
+# explore data distributions without histograms
+map(data_all, skim)
+```
+
+Lots of tables, lots of data, lots of interesting observations to be made! We'll start with a few things that stand out first and might get into more detailed analysis later as we prepare for advanced analytics on specific metriccs.
+
+## What stands out?
+
+### Games
+
+In the games table there seems be an consistent split beween incomplete records (11,762 total) and complete records (14,271 total). This goes for all variables except for 'date', 'season', 'stage' and all the id variables. Lots of missing data to deal with. We might look at how the missing values are distributed over competitions / countries / time / etc later on.
+
+Let's make sure our complete group is indeed a consistent homogeneous set, and the missing values are not scattered around. We'll omit the Maybe starting player positions columns. These variables seem very prone to missing entries as noted in the dataset documentation:
+
+> You will notice that some players are missing from the lineup (NULL values). This is because I have not been able to source their attributes from FIFA. This will be fixed overtime as the crawling algorithm is being improved. The dataset will also be expanded to include international games, national cups, Champion's League and Europa League. Please ask me if you're after a specific tournament.
+
+```{r}
+data_all[[3]] %>% 
+  select(-grep("*player*", as.character(names(data_all[[3]])))) %>% 
+  complete.cases() %>% 
+  sum()
+```
+Okay, that number is way too low as opposed to what we expected. It could be that non-occurances of events are entered as NA's here. For example if a match is player, but no cards were given. Let's take note that the games table needs further inspection if we are to use it in our analysis later on.
+
+### Attributes
+Again, quite a few incomplete records. This time there seem to be two consistent groups of incomplete data (836 and 2713) and a consistent group of complete records with a count of 181,265. Let's make sure this is the case:
+
+```{r}
+data_all[[5]] %>% 
+  complete.cases() %>% 
+  sum()
+```
+
+This number is fairly consistent in what we observed in our skim of the data, excellent!
+
+
+### Tactics
+
+In this table we have a few missing values (969) for the variable 'buildUpPlayDribbling'.
+
+### Other tables
+
+All other tables look good at first glance. 
+
+
+# KPN Consulting assignment 1: Final Season Tables
+
+### Adding wins, draws and losses
+
+First off, we use some simple logic to add columns representing wins, draws, losses and the corresponding points total for the home and away teams.
+
+```{r}
+#generate points from matches
+data_all[[3]] <- data_all[[3]] %>% 
+  mutate(home_team_points = case_when(
+                                  home_team_goal > away_team_goal ~ 3,
+                                  home_team_goal == away_team_goal ~ 1,
+                                  home_team_goal < away_team_goal ~ 0
+                                ),
+        away_team_points = case_when(
+                                  home_team_goal < away_team_goal ~ 3,
+                                  home_team_goal == away_team_goal ~ 1,
+                                  home_team_goal > away_team_goal ~ 0
+                                ), 
+        home_result = case_when(
+                                  home_team_goal > away_team_goal ~ "W",
+                                  home_team_goal == away_team_goal ~ "D",
+                                  home_team_goal < away_team_goal ~ "L"
+                                ),
+        away_result = case_when(
+                                  home_team_goal < away_team_goal ~ "W",
+                                  home_team_goal == away_team_goal ~ "D",
+                                  home_team_goal > away_team_goal ~ "L"
+                                )
+)
+         
+# sanity check
+data_all[[3]] %>% 
+  select(home_team_goal, away_team_goal, home_team_points, away_team_points, home_result, away_result) %>% 
+  tail(20)
+```
+
+Now that the logic works, we'll pivot the data to create a flat file containing everything we need. We've kept the split between home and away games to be be able to slice on that in PowerBI.
+
+```{r}
+# create league flat table with all league tables
+league_tables <- rbind(
+  data_all[[3]] %>% 
+    spread(home_result, home_result) %>% 
+    group_by(league_id, season, home_team_api_id) %>% 
+    summarise("home_or_away" = "home",
+              "Pts" = sum(home_team_points),
+              "GF" = sum(home_team_goal),
+              "GA" = sum(away_team_goal),
+              "W" = sum(!is.na(W)),
+              "D" = sum(!is.na(D)),
+              "L" = sum(!is.na(L)),
+              "Pld" = n()) %>% 
+    mutate(team_api = home_team_api_id, GD = GF - GA) %>% 
+    select(-home_team_api_id),
+  data_all[[3]] %>% 
+    spread(away_result, away_result) %>% 
+    group_by(league_id, season, away_team_api_id) %>% 
+    summarise("home_or_away" = "away",
+              "Pts" = sum(away_team_points),
+              "GF" = sum(away_team_goal),
+              "GA" = sum(home_team_goal),
+              "W" = sum(!is.na(W)),
+              "D" = sum(!is.na(D)),
+              "L" = sum(!is.na(L)),
+              "Pld" = n()) %>% 
+    mutate(team_api = away_team_api_id, GD = GF - GA) %>% 
+    select(-away_team_api_id)
+) %>%
+  left_join(data_all[[2]], by = c("league_id" = "id")) %>% #add League names
+  left_join(data_all[[6]], by = c("team_api" = "team_api_id")) #add team names
+
+# check the result
+league_tables %>% 
+  filter(season == "2014/2015", name == "Netherlands Eredivisie") %>% 
+  select(team_long_name, Pld, W, D, L, GF, GA, GD, Pts) %>% 
+  arrange(desc(Pts))
+```
+
+The gives us a binded table of all league results from seasons. Using the season and league columns we can now easily make our selections in PowerBI. Note that in PowerBI the home and away values will which are split in this flat table will be aggregated to create a league table with 1 row per team.
+
+
+
+
+# KPN Consulting assignment 2: Head-to-head overview
+
+This assignment is completed using solely PowerBI. Please see the PBIX dashboard file for results.
+
+
+
+
+# Extra Feature 1: The Hand of God
+
+As modern football progresses, set pieces such as corners and free kicks have become more advanced as well. Traditionally the tallest players are marked heaviest on long passes, corners and crosses, as they are supposedly most prone to score with their heads. But who are most dangerous high flyers amongst the smaller players? To find out, we will scale both height and heading accuracy and then look at relative accurary points scored relative to smallness (as opposed to tallness).
+
+```{r}
+# create difference ranges of height in CM and heading accuracy
+range_hac <- max(data_all[[5]]$heading_accuracy, na.rm = TRUE)-min(data_all[[5]]$heading_accuracy, na.rm = TRUE)
+range_hgt <- max(data_all[[4]]$height, na.rm = TRUE)-min(data_all[[4]]$height, na.rm = TRUE)
+
+# create relative scales (1-100) for both height and heading accuracy and add them to oin
+temp_df <- data_all[[5]] %>% 
+  left_join(data_all[[4]], by = "player_api_id") %>%
+  mutate(
+    hac_scale = ((heading_accuracy - min(heading_accuracy, na.rm = TRUE)))/range_hac,
+    hgt_tscale = ((height - min(height, na.rm = TRUE)))/range_hgt
+  )
+
+# sanity check on scaled values, should be linear (slope = 1, intercept = 0)
+ggplot(temp_df, aes(x = height, y = hgt_tscale)) + geom_point()
+ggplot(temp_df, aes(x = heading_accuracy, y = hac_scale)) + geom_point()
+```
+
+The scaled features look right. Now we can easily add the Hand of God Rating. We will calculate this for the full player attribute set from all seasons and then take the average per player. Also, we'll only look at players with a heading accuracy of over 70 as are looking to find small players with a decent succes rate in heading.
+
+```{r}
+# adding Hand of God Rating
+temp_df %>%
+  filter(heading_accuracy > 70) %>% 
+  mutate(HoGR = round(rescale((hac_scale / hgt_tscale), to = c(1, 99)))) %>%
+  arrange(desc(HoGR)) %>% 
+  select(player_name, height, overall_rating, heading_accuracy, HoGR) %>% 
+  group_by(player_name) %>% 
+  summarise("avg height" = round(mean(height)),
+            "avg overall rating" = round(mean(overall_rating)),
+            "avg heading_accuracy" = round(mean(heading_accuracy)),
+            "HoGR" = round(mean(HoGR))
+            ) %>% 
+  arrange(desc(HoGR)) %>% 
+  head(20)
+
+# clean up environment
+rm(range_hac, range_hgt)
+```
+
+And here we have our group of 20 elite small headers. One Pablo Piatti absolutely dominating on this score with a Hand of God Rating of 94. Some well known elite players in this top 20 as well, such as Javier Saviola, Paul Scholes and Leighton Baines. Less stars like Sanou and Campo make it high on this list as well. Old man Makelele, here on the back-end of his career, also still proves he can rise up amongst the trees to knock it home.
+
+### Business application
+
+The HoGR can be applied in scouting reports to know who to pay extra attention to during set pieces, despite their height.
+
+# Extra Feature 2: Types of Players
+
+We will use the basic k-means algorithm to seperate players into homogeneous groups based on their attributes.
+
+### Select columns for clustering
+
+```{r}
+# look at the original data
+head(temp_df)
+
+# make a selection and scale the data
+data_cluster <- temp_df %>% 
+  select(overall_rating, potential, crossing, finishing, heading_accuracy, short_passing, volleys, dribbling, curve, free_kick_accuracy, long_passing, ball_control, acceleration, sprint_speed, agility, reactions, balance, shot_power, jumping, stamina, strength, long_shots, aggression, interceptions, positioning, vision, penalties, marking, standing_tackle, sliding_tackle, gk_diving, gk_handling, gk_kicking, gk_positioning, gk_reflexes) %>% 
+  scale()
+
+# reconnect scaled data to player id's
+data_cluster <- data.frame(cbind(temp_df$player_api_id, data_cluster))
+```
+
+### Cleaning data
+
+We know from our inititial data exploration that attributes has some missing values. Let's see how many incomplete records the data has,
+
+```{r}
+# number of total records
+nrow(data_cluster)
+
+# number of missing records
+nrow(data_cluster) - sum(complete.cases(data_cluster))
+
+# number of complete records
+sum(complete.cases(data_cluster))
+
+# percentage of missing records
+((nrow(data_cluster) - sum(complete.cases(data_cluster))) / nrow(data_cluster)) * 100
+```
+
+A total of 1.47% incomplete records. Because of time constraints we are just going to remove this, though this is a bad practice! When we continue our analysis for the client in a later stadium we will have to dive into this.
+
+```{r}
+data_cluster <- data_cluster %>% 
+  drop_na()
+```
+
+
+### Scree and elbow plots to determine clusters
+
+```{r}
+scree_selection <- data_cluster[,-1]          
+
+# scree parameters
+scree_wss <- 0                 # initialize total within sum of squares error
+scree_k   <- 5                 # number of clusters to cycle
+scree_ns <- 10                 # number of random starts to cycle
+
+# For 1 to 15 cluster centers
+for (i in 1:scree_k) {
+  km_out <- kmeans(scree_selection, centers = i, nstart = scree_ns)
+  # Save total within sum of squares to wss variable
+  scree_wss[i] <- km_out$tot.withinss
+}
+
+# Quickplot of total within sum of squares vs. number of clusters
+plot(1:scree_k, scree_wss, type = "b", 
+     xlab = "Number of Clusters", 
+     ylab = "Within groups sum of squares")
+
+# clean up environment
+rm(i, scree_selection, scree_k, scree_ns, scree_wss, km_out)
+```
+
+The elbom clearly shows just to use two clusters. This doesn't seem very exciting. This could be due to goalkeeper ratings and fieldplayer ratings differing from each other greatly, since most fieldplayers are not good goalies. Let's try again with the goalkeeper ratings.
+
+```{r}
+data_cluster_nogk <- data_cluster %>% 
+  select(-gk_diving, -gk_handling, -gk_kicking, -gk_positioning, -gk_reflexes)
+
+tail(data_cluster_nogk)
+```
+
+### Second try scree and elbow plot
+
+```{r}
+scree2_selection <- data_cluster_nogk
+
+# scree parameters
+scree2_wss <- 0                 # initialize total within sum of squares error
+scree2_k   <- 5                 # number of clusters to cycle
+scree2_ns <- 10                 # number of random starts to cycle
+
+# For 1 to 15 cluster centers
+for (i in 1:scree2_k) {
+  km_out2 <- kmeans(scree2_selection, centers = i, nstart = scree2_ns)
+  # Save total within sum of squares to wss variable
+  scree2_wss[i] <- km_out2$tot.withinss
+}
+
+# Quickplot of total within sum of squares vs. number of clusters
+plot(1:scree2_k, scree2_wss, type = "b", 
+     xlab = "Number of Clusters", 
+     ylab = "Within groups sum of squares")
+
+# clean up environment
+rm(i, scree2_selection, scree2_k, scree2_ns, scree2_wss, km_out2)
+```
+
+Again it looks like the elbow in on 2 clusters here, not very satisfying. Let's make a selections of top players from 1 season only and see if that gives us something. We will select players with an overall rating above 80 and won't include goalkeeper ratings. Again the data is scaled ofcourse.
+
+```{r}
+# make relevant selection
+data_cluster_elite <- temp_df %>% 
+  filter(overall_rating > 80) %>% 
+    select(player_api_id, overall_rating, potential, crossing, finishing, heading_accuracy, short_passing, volleys, dribbling, curve, free_kick_accuracy, long_passing, ball_control, acceleration, sprint_speed, agility, reactions, balance, shot_power, jumping, stamina, strength, long_shots, aggression, interceptions, positioning, vision, penalties, marking, standing_tackle, sliding_tackle) %>% 
+  scale() %>% 
+  data.frame()
+
+# check NA %
+((nrow(data_cluster_elite) - sum(complete.cases(data_cluster_elite))) / nrow(data_cluster_elite)) * 100
+```
+
+Less then 1% of the records contains NA's, let drop them in our quick and dirty approach.
+
+```{r}
+# drop incomplete records
+data_cluster_elite <- data_cluster_elite %>% 
+  drop_na()
+```
+
+### Third try scree and elbow plot
+
+```{r}
+
+scree3_selection <- data_cluster_elite[, -1]
+
+# scree parameters
+scree3_wss <- 0                 # initialize total within sum of squares error
+scree3_k   <- 5                 # number of clusters to cycle
+scree3_ns <- 10                 # number of random starts to cycle
+
+# For 1 to 15 cluster centers
+for (i in 1:scree3_k) {
+  km_out3 <- kmeans(scree3_selection, centers = i, nstart = scree3_ns)
+  # Save total within sum of squares to wss variable
+  scree3_wss[i] <- km_out3$tot.withinss
+}
+
+# Quickplot of total within sum of squares vs. number of clusters
+plot(1:scree3_k, scree3_wss, type = "b", 
+     xlab = "Number of Clusters", 
+     ylab = "Within groups sum of squares")
+
+# clean up environment
+rm(i, scree3_selection, scree3_k, scree3_ns, scree3_wss, km_out3)
+```
+
+Just slightly better, but our elbow has been moved to the 3rd cluster. A little bit more differentation luckily. Another step to take would be to apply Principal Component Analysis over the variables, but due to time constraints we will skip that for now.
+
+### Run clustering algorithm
+
+```{r}
+# set random seed for reproducibility
+set.seed(1337)
+
+# run k-means with 3 centers and 20 starts
+k_output <- kmeans(data_cluster_elite[,-1], 3, nstart = 20)
+
+```
+
+### Merge clusters to data
+
+```{r}
+data_cluster_elite$cluster <- k_output$cluster
+```
+
+### Calculate cluster means
+
+```{r}
+# calculate cluster means as seperate columns and bind them together
+clusters <-
+  cbind(
+data_cluster_elite[,-1] %>% 
+  subset(cluster == 1) %>% 
+  colMeans(),
+data_cluster_elite[,-1] %>% 
+  subset(cluster == 2) %>% 
+  colMeans(),
+data_cluster_elite[,-1] %>% 
+  subset(cluster == 3) %>% 
+  colMeans()
+)
+
+# set cluster number as columnnames
+colnames(clusters) = clusters["cluster",]
+```
+
+### Plot cluster heatmap
+
+```{r}
+# remove row names cluster and melt data
+plotdata_h <-clusters[-which(rownames(clusters) %in% c("cluster")), ] %>% 
+  melt()
+
+# remove columns to standardised names
+colnames(plotdata_h) <- c("Var1", "Var2", "value")
+
+# plot heatmap
+ggplot(plotdata_h, aes(Var2, Var1)) + geom_tile(aes(fill = value), colour = "white") + scale_fill_gradient(low = "white", high = "#01B8AA") + theme(legend.position="none", axis.line=element_blank(), axis.ticks=element_blank(), axis.title.x=element_blank(), axis.title.y=element_blank())
+```
+
+### Analysis of clusters
+
+This is great, we can clearly identify three distinct clusters. One cluster cluster where sliding_tackle, standing_tackle, marking, positioning, interceptions, strength and heading_accuracy are relatively higher and offensive qualities relatively lower. We see another cluster where these defensive qualities are all lower, but compensated by a more well rounded profile and relatively higher offensive skills. The third cluster has relative low qualities in most attributes except for strength, stamina, reactions and potential. We could name the three clusters respectively:
+1) Offensive players
+2) Youth players
+3) Defensive players
+In this notebook that order should stand correct. However, if the above code is reiterated again on another machine, the order might change due to the random start component of the k-means algorithm.
+
+
+### Business application
+
+Let players train in different groups to groom different types of development.
+
+```{r}
+# clean up environment
+rm(data_cluster, data_cluster_nogk, data_cluster_elite, clusters, k_output)
+```
+
+
+
+# Extra Feature 3: Prediction of preferred shooting foot
+
+Next we are going to predict shooting foot (class prediction) by looking at a player's attributes. In other words: can players skills be used to predict if they are left or right footed? We will be using ROC for evalution and 10-fold crossvalidation for training.
+
+### Configuring training settings
+
+First let us configure the training settings using the trainControl function from the caret package. By saving the settings to an object and having the random seed set at a constant (1337, set before clustering) we can easily reproduce the configuration when training other models.
+
+```{r}
+cfg_ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  verboseIter = TRUE
+)
+```
+
+### Subsetting data
+
+Now we will create a subset with only the target variable (left or right footedness) and the features predicting it (attributes).
+
+```{r}
+data_cp <- temp_df %>% 
+  select(preferred_foot, overall_rating, potential, crossing, finishing, heading_accuracy, short_passing, volleys, dribbling, curve, free_kick_accuracy, long_passing, ball_control, acceleration, sprint_speed, agility, reactions, balance, shot_power, jumping, stamina, strength, long_shots, aggression, interceptions, positioning, vision, penalties, marking, standing_tackle, sliding_tackle, gk_diving, gk_handling, gk_kicking, gk_positioning, gk_reflexes)
+```
+
+Again, let's check what percentages of the records in incomplete.
+
+```{r}
+# check NA %
+((nrow(data_cp) - sum(complete.cases(data_cp))) / nrow(data_cp)) * 100
+```
+Just 1.47%, because we are working quick and dirty for our first exploration, we are just going to drop these records for now.
+
+```{r}
+data_cp <- data_cp %>% 
+  drop_na()
+```
+
+### Time to train our models
+
+Here we have three instances of model training, all with our same train (and test) configuration settings for model evaluation. This will allow us to make nice comparisions. 
+
+```{r}
+# train general linear model
+model_glm <- train(preferred_foot ~ .,
+                   data = data_cp,
+                   method = "glm",
+                   trControl = cfg_ctrl)
+
+# train with standard classification tree
+model_rpart <- train(preferred_foot ~ .,
+                   data = data_cp,
+                   method = "rpart",
+                   trControl = cfg_ctrl)
+
+# train with general linear mmodel net with lasso and regression (tuned) to possibly prevent overfitting
+model_glmnet <- train(preferred_foot ~ .,
+                   data = data_cp,
+                   tuneGrid = expand.grid(alpha = 0:1, lambda = seq(0.0001, 1, length = 20 )),
+                   method = "glmnet",
+                   trControl = cfg_ctrl)
+
+# use random forest to prevent overfitting
+model_rf <- train(
+                    preferred_foot ~ .,
+                    data = data_cp,
+                    method = "ranger",
+                    trControl = cfg_ctrl)
+```
+
+#### Compare model outputs
+
+```{r}
+# create list of model outcomes
+model_resamples <- list(glm = model_glm, ctree = model_rpart, glmnet = model_glmnet, rf = model_rf) %>% 
+  resamples()
+
+# check out overview of model summaries
+model_resamples %>% 
+  summary()
+
+# compare ROC means and spreads
+model_resamples %>% 
+  dotplot(metric = "ROC")
+
+# Check for for outliers 
+model_resamples %>% 
+  densityplot(metric = "ROC")
+```
+
+Here we can see that the tuned glmnet model has the highest ROC by a noselength. Let's quickly look at the details.
+
+```{r}
+# best parameters used
+model_glmnet$bestTune
+```
+
+### Model application
+
+Now let's apply the model to some of our data to see it in action.
+
+```{r}
+data_cp %>% 
+  mutate(predicted_foot = predict(model_glm, data_cp)) %>% # applying our model object to current dataset
+  mutate(prediction_succes = predicted_foot == preferred_foot) %>% 
+  select(preferred_foot, predicted_foot, prediction_succes) %>% 
+  tail(20)
+```
+
+# Output
+
+To conclude we will store our tables as CSV's so we can easily load them with PowerBI.
+
+```{r}
+write_csv(data_all[[1]], "./data/countries.csv")
+write_csv(data_all[[2]], "./data/competitions.csv")
+write_csv(data_all[[3]], "./data/games.csv")
+write_csv(data_all[[4]], "./data/players.csv")
+write_csv(data_all[[5]], "./data/attributes.csv")
+write_csv(data_all[[6]], "./data/teams.csv")
+write_csv(data_all[[7]], "./data/tactics.csv")
+write_csv(league_tables, "./data/league_tables.csv")
+write_csv(plotdata_h, "./data/plotdata_heatmap.csv")
+```
+
+#### [End of notebook]

@@ -1,0 +1,56 @@
+# Presentation
+
+### Kickoff
+```{r}
+load("D:/football/models.RData")
+```
+
+
+### ROC Curve 
+```{r}
+library(caTools)
+
+# Predict on test: p
+p1 <- predict(model_glm, data_cp, type = "prob")
+# Make ROC curve
+colAUC(p1, data_cp[["preferred_foot"]], plotROC = TRUE)
+```
+
+```{r}
+# create list of model outcomes
+model_resamples <- list(glm = model_glm, ctree = model_rpart, glmnet = model_glmnet, randomforest = model_rf) %>% 
+  resamples()
+
+# check out overview of model summaries
+model_resamples %>% 
+  summary()
+
+# compare ROC means and spreads
+model_resamples %>% 
+  dotplot(metric = "ROC")
+
+# Check for for outliers 
+model_resamples %>% 
+  densityplot(metric = "ROC")
+```
+
+# ROC Random Forest
+
+```{r}
+# Predict on test: p
+p2 <- predict(model_rf, data_cp, type = "prob")
+# Make ROC curve
+colAUC(p2, data_cp[["preferred_foot"]], plotROC = TRUE)
+```
+
+### Explation
+
+- Sensity is true positive rate
+- Specifity is true negative rate
+- Start and end are always (0,0) and (1,1)
+- If line is above linear line then model is better than random guess
+- AUC is max 1,0 * 1,0 = 1,0
+- AUC for random guess is ~ 0,500
+- Evaluates all possible thresholds for splitting probabilities
+==> Choice, you can let the model predict more true positives and the cost off degrading certainty
+==> Other choice, catch less true positives with greater certainty
